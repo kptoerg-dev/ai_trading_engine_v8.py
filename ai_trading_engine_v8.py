@@ -441,6 +441,61 @@ def run_portfolio_backtest(data_dict: Dict[str, pd.DataFrame], prob_dict: Dict[s
 # ============================================================================
 
 def main():
+    def main_with_config(cfg: Config) -> dict:
+    # 1. Daten holen
+    data_dict = {}
+    for ticker in cfg.tickers:
+        raw = _fetch_yfinance(ticker, cfg.benchmark, cfg.start_date, cfg.end_date)
+        data_dict[ticker] = build_features(raw)
+
+    pooled_data = pd.concat(data_dict.values(), keys=cfg.tickers)
+
+    if cfg.run_optuna:
+        cfg = tune_hyperparameters(pooled_data, cfg)
+
+    # Walk-Forward Training
+    split_idx = int(len(pooled_data) * 0.7)
+    train_pool = create_labels(pooled_data.iloc[:split_idx], cfg).dropna(subset=["Target"])
+
+    model = fit_fold_model(train_pool, cfg)
+
+    prob_dict, regime_dict = {}, {}
+    for t, df in data_dict.items():
+        df_eval = df.dropna(subset=list(cfg.features))
+        if model:
+            Xt = model.selector.transform(df_eval[list(cfg.features)])
+            prob_dict[t] = pd.Series(model.model.predict_proba(Xt)[:, 1], index=df_eval.index)
+            
+            if model.gmm:
+                vols = df_eval[['REALIZED_VOL_20']].fillna(0)
+                clusters = model.gmm.predict(vols)
+                regimes = (clusters == model.high_vol_cluster).astype(int)
+                regime_dict[t] = pd.Series(regimes, index=df_eval.index)
+            else:
+                regime_dict[t] = pd.Series(0, index=df_eval.index)
+
+    equity, trades = run_portfolio_backtest(data_dict, prob_dict, regime_dict, cfg)
+
+    # Ergebnisse für die GUI berechnen
+    ret = equity.iloc[-1] / equity.iloc[0] - 1.0 if not equity.empty else 0.0
+    dd = (equity / equity.cummax() - 1.0).min() if not equity.empty else 0.0
+    wins = [t for t in trades if t['pnl'] > 0]
+    win_rate = len(wins) / len(trades) if trades else 0.0
+
+    metrics = {
+        "Endkapital": float(equity.iloc[-1]) if not equity.empty else cfg.initial_cash,
+        "Total Return": float(ret),
+        "Max Drawdown": float(dd),
+        "Win Rate": float(win_rate),
+        "Trades": len(trades)
+    }
+
+    return {
+        "metrics": metrics,
+        "equity": equity,
+        "trades": trades
+    }
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--tune", action="store_true", help="Run Optuna Hyperparameter Tuning")
     args = parser.parse_args()
